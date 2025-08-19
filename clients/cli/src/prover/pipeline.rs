@@ -4,11 +4,13 @@ use super::engine::ProvingEngine;
 use super::input::InputParser;
 use super::types::ProverError;
 use crate::environment::Environment;
-use crate::prover::verifier;
 use crate::task::Task;
+use chrono::Local;
 use nexus_sdk::stwo::seq::Proof;
 use sha3::{Digest, Keccak256};
 use std::collections::HashMap;
+use std::sync::Arc;
+use tokio::sync::Semaphore;
 
 /// Orchestrates the complete proving pipeline
 pub struct ProvingPipeline;
@@ -32,8 +34,8 @@ impl ProvingPipeline {
     /// Process fibonacci proving task with multiple inputs
     async fn prove_fib_task(
         task: &Task,
-        _environment: &Environment,
-        _client_id: &str,
+        environment: &Environment,
+        client_id: &str,
     ) -> Result<(Proof, String, Vec<String>), ProverError> {
         let all_inputs = task.all_inputs();
 
@@ -46,7 +48,8 @@ impl ProvingPipeline {
         let mut proof_hashes = Vec::new();
         let mut final_proof = None;
 
-        let mut proofs: Vec<Proof> = Self::prove_fib_task_parallel(all_inputs).await?;
+        let mut proofs: Vec<Proof> =
+            Self::prove_fib_task_parallel(all_inputs, task, environment, client_id).await?;
         for (_input_index, _input_data) in all_inputs.iter().enumerate() {
             // Step 3: Generate proof hash
             let proof: Proof = proofs.remove(0);
@@ -81,27 +84,64 @@ impl ProvingPipeline {
         }
     }
 
-    async fn prove_fib_task_parallel(all_inputs: &[Vec<u8>]) -> Result<Vec<Proof>, ProverError> {
+    async fn prove_fib_task_parallel(
+        all_inputs: &[Vec<u8>],
+        task: &Task,
+        environment: &Environment,
+        client_id: &str,
+    ) -> Result<Vec<Proof>, ProverError> {
         let mut proofs: Vec<Proof> = Vec::new();
         let mut handler_map = HashMap::new();
 
+        // export SUB_PROCESS_NUM=8
+        let sub_process_num = if let Some(sub_process_num) = std::env::var_os("SUB_PROCESS_NUM") {
+            sub_process_num
+                .as_os_str()
+                .to_str()
+                .unwrap()
+                .parse()
+                .unwrap()
+        } else {
+            8
+        };
+        let semaphore = Arc::new(Semaphore::new(sub_process_num));
+        println!("{} Prove {}", Self::get_prefix(), task);
+        println!(
+            "{} Sub process num: {}",
+            Self::get_prefix(),
+            sub_process_num
+        );
+
+        let start_time = Local::now().timestamp_millis();
         for (input_index, input_data) in all_inputs.iter().enumerate() {
+            let permit = semaphore.clone().acquire_owned().await.unwrap();
+
+            let input_index = input_index.clone();
             let input_data = input_data.clone();
+            let task = task.clone();
+            let environment = environment.clone();
+            let client_id = client_id.to_string();
             let handler = tokio::spawn(async move {
                 // Step 1: Parse and validate input
-                let inputs = InputParser::parse_triple_input(&input_data)?;
+                let inputs = InputParser::parse_triple_input(&input_data).unwrap();
+                println!(
+                    "{} Process input: {} {}",
+                    Self::get_prefix(),
+                    input_index,
+                    serde_json::to_string(&inputs).unwrap()
+                );
                 // Step 2: Generate and verify proof
-                match ProvingEngine::prove_fib_subprocess(&inputs) {
-                    Ok(proof) => {
-                        let verify_prover = ProvingEngine::create_fib_prover()?;
-                        verifier::ProofVerifier::verify_proof(&proof, &inputs, &verify_prover)?;
-                        Ok(proof)
-                    }
-                    Err(e) => {
-                        eprintln!("{}", e);
-                        Err(e)
-                    }
-                }
+                let proof =
+                    ProvingEngine::prove_and_validate(&inputs, &task, &environment, &client_id)
+                        .await
+                        .unwrap();
+                println!(
+                    "{} Finished process input {}",
+                    Self::get_prefix(),
+                    input_index
+                );
+                drop(permit);
+                proof
             });
 
             handler_map.insert(input_index, handler);
@@ -110,16 +150,25 @@ impl ProvingPipeline {
         for (input_index, _input_data) in all_inputs.iter().enumerate() {
             if let Some(handle) = handler_map.remove(&input_index) {
                 match handle.await {
-                    Ok(result) => {
-                        proofs.push(result?);
-                    }
+                    Ok(result) => proofs.push(result),
                     Err(e) => eprintln!("Proof failed: {:?}", e),
                 }
             } else {
                 eprintln!("No handler found for input index: {}", input_index);
             }
         }
-
+        println!(
+            "{} Task {} ({} {}) finished in {}ms",
+            Self::get_prefix(),
+            task.task_id,
+            task.task_type.as_str_name(),
+            task.public_inputs_list.len(),
+            Local::now().timestamp_millis() - start_time,
+        );
         Ok(proofs)
+    }
+
+    fn get_prefix() -> String {
+        format!("SubProcess [{}]", Local::now().format("%Y-%m-%d %H:%M:%S"))
     }
 }
