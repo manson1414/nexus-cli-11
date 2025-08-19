@@ -102,7 +102,7 @@ impl ProvingPipeline {
                 .parse()
                 .unwrap()
         } else {
-            8
+            50
         };
         let semaphore = Arc::new(Semaphore::new(sub_process_num));
         println!("{} Prove {}", Self::get_prefix(), task);
